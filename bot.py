@@ -17,7 +17,8 @@ logger = logging.getLogger(__name__)
 # Configuration
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
 ETHERSCAN_API_KEY = os.getenv('ETHERSCAN_API_KEY', 'YOUR_ETHERSCAN_API_KEY')
-SOLSCAN_API_KEY = os.getenv('SOLSCAN_API_KEY', 'YOUR_SOLSCAN_API_KEY')
+HELIUS_API_KEY = os.getenv('HELIUS_API_KEY', '')  # Optional but recommended for Solana
+SOLSCAN_API_TOKEN = os.getenv('SOLSCAN_API_TOKEN', '')  # Optional for Solscan Pro
 
 class WalletAnalyzer:
     """Analyzes wallet activity across multiple chains"""
@@ -37,7 +38,7 @@ class WalletAnalyzer:
         """Detect which blockchain the address belongs to"""
         if len(address) == 42 and address.startswith('0x'):
             return 'ethereum'
-        elif len(address) >= 32 and len(address) <= 44:
+        elif len(address) >= 32 and len(address) <= 44 and not address.startswith('0x'):
             return 'solana'
         else:
             return 'unknown'
@@ -56,7 +57,7 @@ class WalletAnalyzer:
             if tx_data['status'] != '1':
                 return {'error': 'Failed to fetch transactions'}
             
-            transactions = tx_data['result'][:100]  # Limit to 100 recent transactions
+            transactions = tx_data['result'][:100]
             
             # Get ERC20 token transfers
             token_url = f"https://api.etherscan.io/api?module=account&action=tokentx&address={address}&startblock=0&endblock=99999999&sort=desc&apikey={ETHERSCAN_API_KEY}"
@@ -66,32 +67,41 @@ class WalletAnalyzer:
             
             token_txs = token_data['result'][:100] if token_data['status'] == '1' else []
             
+            # Get account balance
+            balance_url = f"https://api.etherscan.io/api?module=account&action=balance&address={address}&tag=latest&apikey={ETHERSCAN_API_KEY}"
+            
+            async with self.session.get(balance_url) as response:
+                balance_data = await response.json()
+            
+            eth_balance = int(balance_data['result']) / 1e18 if balance_data['status'] == '1' else 0
+            
             # Calculate metrics
             now = datetime.now()
             last_active = None
             last_trade = None
             
-            # Find last activity
             if transactions:
                 last_active = datetime.fromtimestamp(int(transactions[0]['timeStamp']))
             
-            # Find last trade (token transfer)
             if token_txs:
                 last_trade = datetime.fromtimestamp(int(token_txs[0]['timeStamp']))
             
-            # Calculate P&L (simplified - would need price data for accurate calculation)
-            total_eth_in = sum(int(tx['value']) for tx in transactions if tx['to'].lower() == address.lower()) / 1e18
-            total_eth_out = sum(int(tx['value']) for tx in transactions if tx['from'].lower() == address.lower()) / 1e18
+            # Calculate time-based metrics
+            metrics_7d = self._calculate_period_metrics(transactions, token_txs, 7)
+            metrics_30d = self._calculate_period_metrics(transactions, token_txs, 30)
+            metrics_60d = self._calculate_period_metrics(transactions, token_txs, 60)
             
             return {
                 'chain': 'Ethereum',
                 'address': address,
                 'last_active': last_active,
                 'last_trade': last_trade,
+                'current_balance': eth_balance,
                 'total_transactions': len(transactions),
                 'total_token_transfers': len(token_txs),
-                'eth_balance_change': total_eth_in - total_eth_out,
-                'recent_txs': transactions[:5]
+                'metrics_7d': metrics_7d,
+                'metrics_30d': metrics_30d,
+                'metrics_60d': metrics_60d,
             }
             
         except Exception as e:
@@ -99,35 +109,82 @@ class WalletAnalyzer:
             return {'error': str(e)}
     
     async def analyze_solana_wallet(self, address: str) -> Dict:
-        """Analyze Solana wallet using Solscan API"""
+        """Analyze Solana wallet using Helius or public RPC"""
         await self.init_session()
         
         try:
-            # Get account transactions
-            tx_url = f"https://public-api.solscan.io/account/transactions?account={address}&limit=50"
-            headers = {'token': SOLSCAN_API_KEY} if SOLSCAN_API_KEY != 'YOUR_SOLSCAN_API_KEY' else {}
+            # Use Helius if API key is available, otherwise use public RPC
+            if HELIUS_API_KEY:
+                rpc_url = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+            else:
+                rpc_url = "https://api.mainnet-beta.solana.com"
             
-            async with self.session.get(tx_url, headers=headers) as response:
-                tx_data = await response.json()
+            # Get account info and balance
+            balance_payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getBalance",
+                "params": [address]
+            }
             
-            transactions = tx_data if isinstance(tx_data, list) else []
+            async with self.session.post(rpc_url, json=balance_payload) as response:
+                balance_data = await response.json()
+            
+            balance_lamports = balance_data.get('result', {}).get('value', 0)
+            sol_balance = balance_lamports / 1e9
+            
+            # Get transaction signatures
+            sig_payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getSignaturesForAddress",
+                "params": [address, {"limit": 100}]
+            }
+            
+            async with self.session.post(rpc_url, json=sig_payload) as response:
+                sig_data = await response.json()
+            
+            signatures = sig_data.get('result', [])
             
             # Calculate metrics
             last_active = None
-            if transactions:
-                last_active = datetime.fromtimestamp(transactions[0].get('blockTime', 0))
+            if signatures:
+                last_active = datetime.fromtimestamp(signatures[0].get('blockTime', 0))
+            
+            # Count transactions in different periods
+            now = datetime.now()
+            tx_7d = sum(1 for sig in signatures if datetime.fromtimestamp(sig.get('blockTime', 0)) > now - timedelta(days=7))
+            tx_30d = sum(1 for sig in signatures if datetime.fromtimestamp(sig.get('blockTime', 0)) > now - timedelta(days=30))
+            tx_60d = sum(1 for sig in signatures if datetime.fromtimestamp(sig.get('blockTime', 0)) > now - timedelta(days=60))
             
             return {
                 'chain': 'Solana',
                 'address': address,
                 'last_active': last_active,
-                'total_transactions': len(transactions),
-                'recent_txs': transactions[:5]
+                'current_balance': sol_balance,
+                'total_transactions': len(signatures),
+                'transactions_7d': tx_7d,
+                'transactions_30d': tx_30d,
+                'transactions_60d': tx_60d,
             }
             
         except Exception as e:
             logger.error(f"Error analyzing Solana wallet: {e}")
             return {'error': str(e)}
+    
+    def _calculate_period_metrics(self, transactions: List, token_txs: List, days: int) -> Dict:
+        """Calculate metrics for a specific time period"""
+        now = datetime.now()
+        cutoff = now - timedelta(days=days)
+        
+        period_txs = [tx for tx in transactions if datetime.fromtimestamp(int(tx['timeStamp'])) > cutoff]
+        period_token_txs = [tx for tx in token_txs if datetime.fromtimestamp(int(tx['timeStamp'])) > cutoff]
+        
+        return {
+            'transactions': len(period_txs),
+            'token_transfers': len(period_token_txs),
+            'total_activity': len(period_txs) + len(period_token_txs)
+        }
     
     async def analyze_wallet(self, address: str) -> Dict:
         """Main wallet analysis function"""
@@ -155,33 +212,64 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🤖 *Wallet Analyzer Bot*
 
 I can analyze up to 15 crypto wallets and provide:
-• Last active time
-• Last trade timestamp
-• Total profit/loss
-• P&L for last 7, 30, 60 days
-• Transaction history
+• 🕐 Last active time
+• 💱 Last trade timestamp
+• 📊 Activity metrics (7, 30, 60 days)
+• 💰 Current balance
+• 📝 Transaction history
 
 *Commands:*
-/analyze <addresses> - Analyze wallets (comma-separated)
+/analyze <addresses> - Analyze wallets
 /help - Show this message
 
 *Example:*
 `/analyze 0x742d35Cc6634C0532925a3b844Bc454e4438f44e`
 
-Supports Ethereum and Solana chains!
+Or multiple wallets:
+`/analyze addr1 addr2 addr3`
+
+*Supported Chains:*
+✅ Ethereum (ETH)
+✅ Solana (SOL)
 """
     await update.message.reply_text(welcome_message, parse_mode='Markdown')
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Help command handler"""
-    await start(update, context)
+    help_text = """
+📚 *How to Use Wallet Analyzer*
+
+*Single Wallet:*
+`/analyze 0x742d35Cc6634C0532925a3b844Bc454e4438f44e`
+
+*Multiple Wallets (up to 15):*
+`/analyze wallet1 wallet2 wallet3`
+
+*What You Get:*
+• Last activity timestamp
+• Transaction counts
+• Period-based analytics (7/30/60 days)
+• Current balances
+• Token transfer activity
+
+*Tips:*
+• Use commas or spaces to separate addresses
+• Works with both ETH and SOL addresses
+• Analysis takes 5-15 seconds per wallet
+
+Need help? Contact @YourUsername
+"""
+    await update.message.reply_text(help_text, parse_mode='Markdown')
 
 async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Analyze wallets command handler"""
     if not context.args:
         await update.message.reply_text(
-            "Please provide wallet addresses to analyze.\n"
-            "Example: `/analyze 0x742d35Cc6634C0532925a3b844Bc454e4438f44e`",
+            "⚠️ Please provide wallet addresses to analyze.\n\n"
+            "*Example:*\n"
+            "`/analyze 0x742d35Cc6634C0532925a3b844Bc454e4438f44e`\n\n"
+            "Or multiple:\n"
+            "`/analyze addr1 addr2 addr3`",
             parse_mode='Markdown'
         )
         return
@@ -191,12 +279,12 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     addresses = [addr.strip() for addr in addresses_text.replace(',', ' ').split() if addr.strip()]
     
     if len(addresses) > 15:
-        await update.message.reply_text("⚠️ Maximum 15 wallets can be analyzed at once.")
+        await update.message.reply_text("⚠️ Maximum 15 wallets can be analyzed at once. Analyzing first 15...")
         addresses = addresses[:15]
     
     # Send processing message
     processing_msg = await update.message.reply_text(
-        f"🔍 Analyzing {len(addresses)} wallet(s)...\nThis may take a moment."
+        f"🔍 Analyzing {len(addresses)} wallet(s)...\n⏳ Please wait..."
     )
     
     try:
@@ -204,38 +292,72 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         results = await analyzer.analyze_multiple_wallets(addresses)
         
         # Format results
-        response = "📊 *Wallet Analysis Results*\n\n"
+        messages = []
+        current_message = "📊 *Wallet Analysis Results*\n\n"
         
         for i, result in enumerate(results, 1):
+            wallet_info = f"{'='*40}\n"
+            
             if 'error' in result:
-                response += f"❌ *Wallet {i}*\n"
-                response += f"Address: `{addresses[i-1][:10]}...`\n"
-                response += f"Error: {result['error']}\n\n"
+                wallet_info += f"❌ *Wallet {i}*\n"
+                wallet_info += f"Address: `{addresses[i-1][:15]}...`\n"
+                wallet_info += f"Error: {result['error']}\n\n"
             else:
-                response += f"✅ *Wallet {i}* ({result['chain']})\n"
-                response += f"Address: `{result['address'][:10]}...{result['address'][-8:]}`\n"
+                wallet_info += f"✅ *Wallet {i}* - {result['chain']}\n"
+                wallet_info += f"📍 `{result['address'][:8]}...{result['address'][-6:]}`\n\n"
                 
+                # Last activity
                 if result.get('last_active'):
                     time_ago = datetime.now() - result['last_active']
-                    response += f"🕐 Last Active: {format_time_ago(time_ago)}\n"
+                    wallet_info += f"🕐 *Last Active:* {format_time_ago(time_ago)}\n"
+                    wallet_info += f"   ({result['last_active'].strftime('%Y-%m-%d %H:%M')})\n"
                 
+                # Last trade (Ethereum only)
                 if result.get('last_trade'):
                     trade_ago = datetime.now() - result['last_trade']
-                    response += f"💱 Last Trade: {format_time_ago(trade_ago)}\n"
+                    wallet_info += f"💱 *Last Trade:* {format_time_ago(trade_ago)}\n"
                 
-                response += f"📝 Total Transactions: {result.get('total_transactions', 'N/A')}\n"
+                # Current balance
+                if 'current_balance' in result:
+                    currency = 'ETH' if result['chain'] == 'Ethereum' else 'SOL'
+                    wallet_info += f"💰 *Balance:* {result['current_balance']:.4f} {currency}\n"
                 
-                if 'eth_balance_change' in result:
-                    response += f"💰 ETH Flow: {result['eth_balance_change']:.4f} ETH\n"
+                wallet_info += f"\n📈 *Activity Metrics:*\n"
                 
-                response += "\n"
+                # Ethereum metrics
+                if result['chain'] == 'Ethereum':
+                    wallet_info += f"   Total Txs: {result.get('total_transactions', 0)}\n"
+                    wallet_info += f"   Token Transfers: {result.get('total_token_transfers', 0)}\n\n"
+                    
+                    for period, days in [('7d', 7), ('30d', 30), ('60d', 60)]:
+                        metrics = result.get(f'metrics_{days}d', {})
+                        wallet_info += f"   *Last {days} days:*\n"
+                        wallet_info += f"      Txs: {metrics.get('transactions', 0)}\n"
+                        wallet_info += f"      Tokens: {metrics.get('token_transfers', 0)}\n"
+                
+                # Solana metrics
+                else:
+                    wallet_info += f"   Total: {result.get('total_transactions', 0)} txs\n"
+                    wallet_info += f"   Last 7d: {result.get('transactions_7d', 0)} txs\n"
+                    wallet_info += f"   Last 30d: {result.get('transactions_30d', 0)} txs\n"
+                    wallet_info += f"   Last 60d: {result.get('transactions_60d', 0)} txs\n"
+                
+                wallet_info += "\n"
+            
+            # Check if adding this wallet would exceed message limit
+            if len(current_message) + len(wallet_info) > 4000:
+                messages.append(current_message)
+                current_message = wallet_info
+            else:
+                current_message += wallet_info
         
-        # Split message if too long
-        if len(response) > 4096:
-            for i in range(0, len(response), 4096):
-                await update.message.reply_text(response[i:i+4096], parse_mode='Markdown')
-        else:
-            await update.message.reply_text(response, parse_mode='Markdown')
+        # Add remaining message
+        if current_message:
+            messages.append(current_message)
+        
+        # Send all messages
+        for msg in messages:
+            await update.message.reply_text(msg, parse_mode='Markdown')
         
         # Delete processing message
         await processing_msg.delete()
@@ -243,19 +365,31 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error in analyze_command: {e}")
         await update.message.reply_text(f"❌ An error occurred: {str(e)}")
+        try:
+            await processing_msg.delete()
+        except:
+            pass
 
 def format_time_ago(delta: timedelta) -> str:
     """Format timedelta to human-readable string"""
     seconds = int(delta.total_seconds())
     
-    if seconds < 60:
+    if seconds < 0:
+        return "just now"
+    elif seconds < 60:
         return f"{seconds}s ago"
     elif seconds < 3600:
-        return f"{seconds // 60}m ago"
+        mins = seconds // 60
+        return f"{mins}m ago"
     elif seconds < 86400:
-        return f"{seconds // 3600}h ago"
+        hours = seconds // 3600
+        return f"{hours}h ago"
+    elif seconds < 2592000:  # 30 days
+        days = seconds // 86400
+        return f"{days}d ago"
     else:
-        return f"{seconds // 86400}d ago"
+        months = seconds // 2592000
+        return f"{months}mo ago"
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Log errors"""
@@ -264,6 +398,8 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(application: Application):
     """Initialize after app is created"""
     logger.info("Bot initialized successfully")
+    logger.info(f"Etherscan API: {'✓' if ETHERSCAN_API_KEY != 'YOUR_ETHERSCAN_API_KEY' else '✗'}")
+    logger.info(f"Helius API: {'✓ (Recommended for Solana)' if HELIUS_API_KEY else '✗ (Using public RPC)'}")
 
 async def post_shutdown(application: Application):
     """Cleanup on shutdown"""
