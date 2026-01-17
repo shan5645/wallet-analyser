@@ -4,8 +4,8 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import aiohttp
 import asyncio
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # Configure logging
 logging.basicConfig(
@@ -80,7 +80,6 @@ class WalletAnalyzer:
                 last_trade = datetime.fromtimestamp(int(token_txs[0]['timeStamp']))
             
             # Calculate P&L (simplified - would need price data for accurate calculation)
-            # This is a placeholder implementation
             total_eth_in = sum(int(tx['value']) for tx in transactions if tx['to'].lower() == address.lower()) / 1e18
             total_eth_out = sum(int(tx['value']) for tx in transactions if tx['from'].lower() == address.lower()) / 1e18
             
@@ -262,10 +261,25 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Log errors"""
     logger.error(f"Update {update} caused error {context.error}")
 
+async def post_init(application: Application):
+    """Initialize after app is created"""
+    logger.info("Bot initialized successfully")
+
+async def post_shutdown(application: Application):
+    """Cleanup on shutdown"""
+    await analyzer.close_session()
+    logger.info("Bot shutdown complete")
+
 def main():
     """Start the bot"""
     # Create application
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
     
     # Add handlers
     application.add_handler(CommandHandler("start", start))
@@ -276,7 +290,7 @@ def main():
     application.add_error_handler(error_handler)
     
     # Start bot
-    logger.info("Bot started!")
+    logger.info("Bot starting...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
