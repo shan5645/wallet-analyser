@@ -11,10 +11,17 @@ from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQuer
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
-ETHERSCAN_API_KEY = os.getenv('ETHERSCAN_API_KEY', 'YOUR_ETHERSCAN_API_KEY')
-HELIUS_API_KEY = os.getenv('HELIUS_API_KEY', '')
-COINGECKO_API_KEY = os.getenv('COINGECKO_API_KEY', '')
+# Load environment variables
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+ETHERSCAN_API_KEY = os.environ.get('ETHERSCAN_API_KEY', '')
+HELIUS_API_KEY = os.environ.get('HELIUS_API_KEY', '')
+COINGECKO_API_KEY = os.environ.get('COINGECKO_API_KEY', '')
+
+# Log what we loaded (without showing full keys)
+logger.info(f"Loaded TELEGRAM_BOT_TOKEN: {'✓' if TELEGRAM_BOT_TOKEN else '✗'}")
+logger.info(f"Loaded ETHERSCAN_API_KEY: {'✓' if ETHERSCAN_API_KEY else '✗'}")
+logger.info(f"Loaded HELIUS_API_KEY: {'✓' if HELIUS_API_KEY else '✗'} (length: {len(HELIUS_API_KEY)})")
+logger.info(f"Loaded COINGECKO_API_KEY: {'✓' if COINGECKO_API_KEY else '✗'}")
 
 class WalletAnalyzer:
     def __init__(self):
